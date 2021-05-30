@@ -46,6 +46,7 @@ namespace XIVLauncher.Windows
 
         private AccountManager _accountManager;
 
+        private bool _previousLoginFailure = false; // To prevent locking peoples accounts, prevent the auto OTP, just in case
         private bool _isLoggingIn;
 
         public MainWindow()
@@ -460,23 +461,65 @@ namespace XIVLauncher.Windows
             var otp = "";
             if (OtpCheckBox.IsChecked == true && !hasValidCache)
             {
-                var otpDialog = new OtpInputDialog();
-                otpDialog.ShowDialog();
-
-                if (otpDialog.Result == null)
+                if (!string.IsNullOrWhiteSpace(_accountManager?.CurrentAccount?.OtpUri) && !_previousLoginFailure)
                 {
-                    _isLoggingIn = false;
-
-                    if (autoLogin)
+                    try
                     {
-                        CleanUp();
-                        Environment.Exit(0);
+                        OtpNet.Totp totp;
+
+                        if (Uri.TryCreate(_accountManager.CurrentAccount.OtpUri, UriKind.Absolute, out Uri uri))
+                        {
+                            var query = System.Web.HttpUtility.ParseQueryString(uri.Query);
+
+                            if (!query.AllKeys.Contains("secret"))
+                            {
+                                throw new Exception("No Secret");
+                            }
+
+                            var secretKey = OtpNet.Base32Encoding.ToBytes(query["secret"]);
+                            if (!query.AllKeys.Contains("period") || !int.TryParse(query["period"], out int period))
+                                period = 30;
+                            if (!query.AllKeys.Contains("digits") || !int.TryParse(query["digits"], out int digits))
+                                digits = 6;
+                            if (!query.AllKeys.Contains("algorithm") || !Enum.TryParse(query["algorithm"], true, out OtpNet.OtpHashMode algorithm))
+                                algorithm = OtpNet.OtpHashMode.Sha1;
+
+                            totp = new OtpNet.Totp(secretKey, step: period, mode: algorithm, totpSize: digits);
+
+                        }
+                        else
+                        {
+                            var secretKey = OtpNet.Base32Encoding.ToBytes(_accountManager.CurrentAccount.OtpUri);
+                            totp = new OtpNet.Totp(secretKey);
+                        }
+                        otp = totp.ComputeTotp();
+                    }
+                    catch (Exception)
+                    {
+                        otp = "";   // Just ignore whatever happened, the prompt will come up instead.
+                    }
+                }
+                
+                if (string.IsNullOrEmpty(otp))
+                {
+                    var otpDialog = new OtpInputDialog();
+                    otpDialog.ShowDialog();
+
+                    if (otpDialog.Result == null)
+                    {
+                        _isLoggingIn = false;
+
+                        if (autoLogin)
+                        {
+                            CleanUp();
+                            Environment.Exit(0);
+                        }
+
+                        return;
                     }
 
-                    return;
+                    otp = otpDialog.Result;
                 }
-
-                otp = otpDialog.Result;
             }
 
             StartLogin(otp, startGame);
@@ -592,6 +635,24 @@ namespace XIVLauncher.Windows
                 {
                     Log.Verbose(
                         $"[LR] {loginResult.State} {loginResult.PendingPatches != null} {loginResult.OauthLogin?.Playable}");
+
+                    if (loginResult.State == Launcher.LoginState.NoOAuth)
+                    {
+                        var failedOauthMessage = Loc.Localize("LoginNoOauthMessage", "Could not login into your Square Enix account.\nThis could be caused by bad credentials or OTPs.\n\nPlease also check your email inbox for any messages from Square Enix - they might want you to reset your password due to \"suspicious activity\".\nThis is NOT caused by a security issue in XIVLauncher, it is merely a safety measure by Square Enix to prevent logins from new locations, in case your account is getting stolen.\nXIVLauncher and the official launcher will work fine again after resetting your password.");
+                        if (App.Settings.AutologinEnabled)
+                        {
+                            failedOauthMessage += Loc.Localize("LoginNoOauthAutologinHint", "\n\nAuto-Login has been disabled.");
+                            App.Settings.AutologinEnabled = false;
+                        }
+
+                        CustomMessageBox.Show(failedOauthMessage, Loc.Localize("LoginNoOauthTitle", "Login issue"), MessageBoxButton.OK, MessageBoxImage.Error);
+
+                        _previousLoginFailure = true;   // Prevents auto OTP being populated.
+                        _isLoggingIn = false;
+                        Show();
+                        Activate();
+                        return;
+                    }
 
                     if (loginResult.State == Launcher.LoginState.NoService)
                     {
