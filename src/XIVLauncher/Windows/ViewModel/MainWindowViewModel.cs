@@ -26,6 +26,7 @@ namespace XIVLauncher.Windows.ViewModel
     class MainWindowViewModel : INotifyPropertyChanged
     {
         public bool IsLoggingIn;
+        private bool _previousLoginFailure = false; // To prevent locking peoples accounts, prevent the auto OTP, just in case
 
         private readonly Launcher _launcher = new();
         private readonly Game.Patch.PatchInstaller _installer = new();
@@ -134,12 +135,62 @@ namespace XIVLauncher.Windows.ViewModel
 
             var otp = string.Empty;
             if (IsOtp && !hasValidCache)
-                otp = AskForOtp();
+                if (!string.IsNullOrWhiteSpace(AccountManager?.CurrentAccount?.OtpUri) && !_previousLoginFailure)
+                {
+                    try
+                    {
+                        OtpNet.Totp totp;
 
-            if (otp == null)
+                        if (Uri.TryCreate(AccountManager.CurrentAccount.OtpUri, UriKind.Absolute, out Uri uri))
+                        {
+                            var query = System.Web.HttpUtility.ParseQueryString(uri.Query);
+
+                            if (!query.AllKeys.Contains("secret"))
+                            {
+                                throw new Exception("No Secret");
+                            }
+
+                            var secretKey = OtpNet.Base32Encoding.ToBytes(query["secret"]);
+                            if (!query.AllKeys.Contains("period") || !int.TryParse(query["period"], out int period))
+                                period = 30;
+                            if (!query.AllKeys.Contains("digits") || !int.TryParse(query["digits"], out int digits))
+                                digits = 6;
+                            if (!query.AllKeys.Contains("algorithm") || !Enum.TryParse(query["algorithm"], true, out OtpNet.OtpHashMode algorithm))
+                                algorithm = OtpNet.OtpHashMode.Sha1; totp = new OtpNet.Totp(secretKey, step: period, mode: algorithm, totpSize: digits);
+
+                        }
+                        else
+                        {
+                            var secretKey = OtpNet.Base32Encoding.ToBytes(AccountManager.CurrentAccount.OtpUri);
+                            totp = new OtpNet.Totp(secretKey);
+                        }
+                        otp = totp.ComputeTotp();
+                    }
+                    catch (Exception)
+                    {
+                        otp = "";   // Just ignore whatever happened, the prompt will come up instead.
+                    }
+                }
+
+            if (string.IsNullOrEmpty(otp))
             {
-                Reactivate();
-                return;
+                var otpDialog = new OtpInputDialog();
+                otpDialog.ShowDialog();
+
+                if (otpDialog.Result == null)
+                {
+                    IsLoggingIn = false;
+
+                    if (doingAutoLogin)
+                    {
+                        CleanUp();
+                        Environment.Exit(0);
+                    }
+
+                    return;
+                }
+
+                otp = otpDialog.Result;
             }
 
             PersistAccount(username, password);
